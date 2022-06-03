@@ -8,16 +8,476 @@
 
 		<link rel="stylesheet" href="dist/reset.css">
 		<link rel="stylesheet" href="dist/reveal.css">
-		<link rel="stylesheet" href="dist/theme/black.css">
+		<link rel="stylesheet" href="dist/theme/white.css">
 
 		<!-- Theme used for syntax highlighted code -->
 		<link rel="stylesheet" href="plugin/highlight/monokai.css">
+		<style>
+			.reveal pre code {
+				max-height: calc(100vh - 5rem);
+			}
+			.hljs-deletion {
+				color: crimson;
+			}
+		</style>
 	</head>
 	<body>
 		<div class="reveal">
 			<div class="slides">
-				<section>Slide 1</section>
-				<section>Slide 2</section>
+				<section data-markdown>
+					# JavaScript micro-optimizations
+					## Improving CPU performance in the `topobuf` library
+				</section>
+				<section data-markdown>
+					# Primary take-away
+					### Don't do this. It's probably not worth it
+				</section>
+				<section data-background-image="/images/grover-no.jpg" data-background-size="contain">
+				</section>
+				<section data-markdown>
+					## You're still here?
+					OK, fine.
+				</section>
+				<section data-markdown>
+					# Baseline
+					Always important to measure your efforts, and know what your goal is. We ideally wanted `topobuf` to be faster than `JSON.parse`
+				</section>
+				<section data-markdown>
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  203.09|  180.04|  159.75|  629.76|   30.85|
+|      JSON.parse&nbsp;de|  118.57|  108.00|  100.35|  397.44|   32.53|
+|         topobuf&nbsp;nj| 1308.09| 1255.69| 1129.22| 1579.52|   11.37|
+|      JSON.parse&nbsp;nj|  899.58|  752.35|  719.19| 1242.87|   22.23|
+|         topobuf&nbsp;pa| 6366.98| 6353.54| 5780.21| 7254.15|    2.35|
+|      JSON.parse&nbsp;pa| 2778.16| 2802.84| 2595.76| 2919.13|    3.55|
+				</section>
+				<section data-markdown>
+					# Lesson #1
+					Allocating variables is costly.
+					
+					Corollary: Globals are good.
+					
+					More global variables = more better.
+				</section>
+				<section data-markdown>
+					```diff
+					diff --git a/decode.js b/decode.js
+index cc0d695..095cb3b 100644
+--- a/decode.js
++++ b/decode.js
+@@ -2,7 +2,7 @@
+ 
+ module.exports = decode;
+ 
+-var keys, values, lengths, dim, e, transformed, names;
++var keys, values, lengths, dim, e, transformed, names, prevP;
+ 
+ var geometryTypes = ['Point', 'MultiPoint', 'LineString', 'MultiLineString',
+                       'Polygon', 'MultiPolygon', 'GeometryCollection'];
+@@ -38,8 +38,10 @@ function readTopology(pbf, topology) {
+     topology.objects = {};
+     topology.arcs = [];
+     names = [];
++    prevP = new Array(dim);
+     pbf.readMessage(readTopologyField, topology);
+     names = null;
++    prevP = null;
+     return topology;
+ }
+ 
+@@ -137,7 +139,6 @@ function readLinePart(pbf, end, len, isMultiPoint) {
+         }
+ 
+     } else {
+-        var prevP = [];
+         for (d = 0; d < dim; d++) prevP[d] = 0;
+ 
+         while (len ? i < len : pbf.pos < end) {
+
+					```
+				</section>
+				<section data-markdown>
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  181.08|  173.49|  155.65|  281.18|   13.31|
+|         topobuf&nbsp;nj| 1281.16| 1217.52| 1096.96| 1567.49|   11.70|
+|         topobuf&nbsp;pa| 6213.74| 6214.54| 5709.89| 7058.57|    2.30|
+				</section>
+				<section data-markdown>
+					# Lesson #2
+					Move things out of the loop body when you can.
+				</section>
+				<section data-markdown>
+					```diff
+diff --git a/decode.js b/decode.js
+index cb24f45..2152e4c 100644
+--- a/decode.js
++++ b/decode.js
+@@ -162,8 +162,9 @@ function readMultiLine(pbf) {
+     var end = pbf.readVarint() + pbf.pos;
+     if (!lengths) return [readLinePart(pbf, end)];
+ 
+-    var coords = [];
+-    for (var i = 0; i < lengths.length; i++) coords.push(readLinePart(pbf, end, lengths[i]));
++    var len = lengths.length,
++        coords = [];
++    for (var i = 0; i < len; i++) coords.push(readLinePart(pbf, end, lengths[i]));
+     lengths = null;
+     return coords;
+ }
+@@ -172,11 +173,13 @@ function readMultiPolygon(pbf) {
+     var end = pbf.readVarint() + pbf.pos;
+     if (!lengths) return [[readLinePart(pbf, end)]];
+ 
++    var len = lengths[0];
+     var coords = [];
+     var j = 1;
+-    for (var i = 0; i < lengths[0]; i++) {
+-        var rings = [];
+-        for (var k = 0; k < lengths[j]; k++) rings.push(readLinePart(pbf, end, lengths[j + 1 + k]));
++    for (var i = 0; i < len; i++) {
++        var rlen = lengths[j],
++            rings = [];
++        for (var k = 0; k < rlen; k++) rings.push(readLinePart(pbf, end, lengths[j + 1 + k]));
+         j += lengths[j] + 1;
+         coords.push(rings);
+     }
+@@ -185,12 +188,14 @@ function readMultiPolygon(pbf) {
+ }
+ 
+ function readArcs(pbf) {
+-    var lines = [],
++    var len = lengths.length,
++        lines = [],
+         end = pbf.readVarint() + pbf.pos;
+ 
+-    for (var i = 0; i < lengths.length; i++) {
+-        var ring = [];
+-        for (var j = 0; j < lengths[i]; j++) {
++    for (var i = 0; i < len; i++) {
++        var rlen = lengths[i],
++            ring = [];
++        for (var j = 0; j < rlen; j++) {
+             var p = [];
+             for (var d = 0; d < dim && pbf.pos < end; d++) p[d] = transformCoord(pbf.readSVarint());
+             ring.push(p);
+					```
+				</section>
+				<section data-markdown>
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  181.39|  172.22|  157.04|  269.81|   14.89|
+|         topobuf&nbsp;nj| 1284.92| 1228.63| 1084.90| 1559.30|   12.07|
+|         topobuf&nbsp;pa| 6222.40| 6205.61| 5751.11| 7075.77|    3.02|
+				</section>
+				<section data-markdown>
+					# Lesson #3
+					Sometimes "move things out of the loop" is less obvious than it seems. `Array.push` or indexing can resize arrays when they exceed their capacity.
+				</section>
+				<section data-markdown>
+					```diff
+diff --git a/decode.js b/decode.js
+index 2152e4c..8a78eee 100644
+--- a/decode.js
++++ b/decode.js
+@@ -126,14 +126,14 @@ function readPoint(pbf) {
+ 
+ function readLinePart(pbf, end, len, isMultiPoint) {
+     var i = 0,
+-        coords = [],
++        coords = len ? new Array(len) : [],
+         p, d;
+ 
+     if (!isMultiPoint) {
+         p = 0;
+         while (len ? i < len : pbf.pos < end) {
+             p += pbf.readSVarint();
+-            coords.push(p);
++            coords[i] = p;
+             i++;
+         }
+ 
+@@ -141,12 +141,12 @@ function readLinePart(pbf, end, len, isMultiPoint) {
+         for (d = 0; d < dim; d++) prevP[d] = 0;
+ 
+         while (len ? i < len : pbf.pos < end) {
+-            p = [];
++            p = new Array(dim);
+             for (d = 0; d < dim; d++) {
+                 prevP[d] += pbf.readSVarint();
+                 p[d] = transformCoord(prevP[d]);
+             }
+-            coords.push(p);
++            coords[i] = p;
+             i++;
+         }
+     }
+@@ -163,8 +163,8 @@ function readMultiLine(pbf) {
+     if (!lengths) return [readLinePart(pbf, end)];
+ 
+     var len = lengths.length,
+-        coords = [];
+-    for (var i = 0; i < len; i++) coords.push(readLinePart(pbf, end, lengths[i]));
++        coords = new Array(len);
++    for (var i = 0; i < len; i++) coords[i] = readLinePart(pbf, end, lengths[i]);
+     lengths = null;
+     return coords;
+ }
+@@ -174,14 +174,14 @@ function readMultiPolygon(pbf) {
+     if (!lengths) return [[readLinePart(pbf, end)]];
+ 
+     var len = lengths[0];
+-    var coords = [];
++    var coords = new Array(len);
+     var j = 1;
+     for (var i = 0; i < len; i++) {
+         var rlen = lengths[j],
+-            rings = [];
+-        for (var k = 0; k < rlen; k++) rings.push(readLinePart(pbf, end, lengths[j + 1 + k]));
++            rings = new Array(rlen);
++        for (var k = 0; k < rlen; k++) rings[k] = readLinePart(pbf, end, lengths[j + 1 + k]);
+         j += lengths[j] + 1;
+-        coords.push(rings);
++        coords[i] = rings;
+     }
+     lengths = null;
+     return coords;
+@@ -189,18 +189,18 @@ function readMultiPolygon(pbf) {
+ 
+ function readArcs(pbf) {
+     var len = lengths.length,
+-        lines = [],
++        lines = new Array(len),
+         end = pbf.readVarint() + pbf.pos;
+ 
+     for (var i = 0; i < len; i++) {
+         var rlen = lengths[i],
+-            ring = [];
++            ring = new Array(rlen);
+         for (var j = 0; j < rlen; j++) {
+-            var p = [];
++            var p = new Array(dim);
+             for (var d = 0; d < dim && pbf.pos < end; d++) p[d] = transformCoord(pbf.readSVarint());
+-            ring.push(p);
++            ring[j] = p;
+         }
+-        lines.push(ring);
++        lines[i] = ring;
+     }
+ 
+     return lines;
+					```
+				</section>
+				<section data-markdown>
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  128.16|  125.40|  110.55|  189.27|   11.12|
+|         topobuf&nbsp;nj|  923.07|  847.25|  802.91| 1144.96|   13.42|
+|         topobuf&nbsp;pa| 2431.33| 2436.96| 2328.63| 2495.28|    1.40|
+				</section>
+				<section data-markdown>
+					# Lesson #4
+					What even is a "loop" anyways? Make sure to analyze the whole code path when looking for data that you can avoid re-allocating
+				</section>
+				<section data-markdown>
+					```diff
+diff --git a/decode.js b/decode.js
+index 8a78eee..cf03c28 100644
+--- a/decode.js
++++ b/decode.js
+@@ -2,7 +2,7 @@
+ 
+ module.exports = decode;
+ 
+-var keys, values, lengths, dim, e, transformed, names, prevP;
++var keys, values, lengths, dim, e, transformed, names, prevP, valuesIndex;
+ 
+ var geometryTypes = ['Point', 'MultiPoint', 'LineString', 'MultiLineString',
+                       'Polygon', 'MultiPolygon', 'GeometryCollection'];
+@@ -15,8 +15,10 @@ function decode(pbf) {
+ 
+     keys = [];
+     values = [];
++    valuesIndex = 0;
+     var obj = pbf.readFields(readDataField, {});
+     keys = null;
++    values = null;
+ 
+     return obj;
+ }
+@@ -55,7 +57,7 @@ function readTopologyField(tag, topology, pbf) {
+     else if (tag === 4) lengths = pbf.readPackedVarint();
+     else if (tag === 5) topology.arcs = readArcs(pbf);
+ 
+-    else if (tag === 13) values.push(readValue(pbf));
++    else if (tag === 13) values[valuesIndex++] = readValue(pbf);
+     else if (tag === 15) readProps(pbf, topology);
+ }
+ 
+@@ -72,7 +74,7 @@ function readGeometryField(tag, geom, pbf) {
+     else if (tag === 11) geom.id = pbf.readString();
+     else if (tag === 12) geom.id = pbf.readSVarint();
+ 
+-    else if (tag === 13) values.push(readValue(pbf));
++    else if (tag === 13) values[valuesIndex++] = readValue(pbf);
+     else if (tag === 14) geom.properties = readProps(pbf, {});
+     else if (tag === 15) readProps(pbf, geom);
+ }
+@@ -106,7 +108,7 @@ function readValue(pbf) {
+ function readProps(pbf, props) {
+     var end = pbf.readVarint() + pbf.pos;
+     while (pbf.pos < end) props[keys[pbf.readVarint()]] = values[pbf.readVarint()];
+-    values = [];
++    valuesIndex = 0;
+     return props;
+ }
+
+					```
+				</section>
+				<section data-markdown>
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  122.34|  119.10|  106.52|  175.38|    9.68|
+|         topobuf&nbsp;nj|  896.14|  815.80|  775.37| 1113.98|   14.68|
+|         topobuf&nbsp;pa| 2380.20| 2367.43| 2227.35| 3195.23|    4.25|
+				</section>
+				<section data-markdown>
+					# Lesson #5
+					Have you tried just running less code? Removing dead code and simplifying functions can have an impact.
+				</section>
+				<section data-markdown>
+					```diff
+diff --git a/decode.js b/decode.js
+index 3d8fa95..2fbe407 100644
+--- a/decode.js
++++ b/decode.js
+@@ -82,7 +82,7 @@ function readGeometryField(tag, geom, pbf) {
+ 
+ function readCoords(geom, pbf, type) {
+     if (type === 'Point') geom.coordinates = readPoint(pbf);
+-    else if (type === 'MultiPoint') geom.coordinates = readLine(pbf, true);
++    else if (type === 'MultiPoint') geom.coordinates = readMultiPoint(pbf);
+     else if (type === 'LineString') geom.arcs = readLine(pbf);
+     else if (type === 'MultiLineString' || type === 'Polygon') geom.arcs = readMultiLine(pbf);
+     else if (type === 'MultiPolygon') geom.arcs = readMultiPolygon(pbf);
+@@ -127,38 +127,46 @@ function readPoint(pbf) {
+     return coords;
+ }
+ 
+-function readLinePart(pbf, end, len, isMultiPoint) {
++function readMultiPointPart(pbf, end) {
+     var i = 0,
+-        coords = len ? new Array(len) : [],
++        coords = [],
+         p, d;
+ 
+-    if (!isMultiPoint) {
+-        p = 0;
+-        while (len ? i < len : pbf.pos < end) {
+-            p += pbf.readSVarint();
+-            coords[i] = p;
+-            i++;
+-        }
++    for (d = 0; d < dim; d++) prevP[d] = 0;
+ 
+-    } else {
+-        for (d = 0; d < dim; d++) prevP[d] = 0;
+-
+-        while (len ? i < len : pbf.pos < end) {
+-            p = new Array(dim);
+-            for (d = 0; d < dim; d++) {
+-                prevP[d] += pbf.readSVarint();
+-                p[d] = transformCoord(prevP[d]);
+-            }
+-            coords[i] = p;
+-            i++;
++    while (pbf.pos < end) {
++        p = new Array(dim);
++        for (d = 0; d < dim; d++) {
++            prevP[d] += pbf.readSVarint();
++            p[d] = transformCoord(prevP[d]);
+         }
++        coords[i] = p;
++        i++;
+     }
+ 
+     return coords;
+ }
+ 
+-function readLine(pbf, isMultiPoint) {
+-    return readLinePart(pbf, pbf.readVarint() + pbf.pos, null, isMultiPoint);
++function readLinePart(pbf, end, len) {
++    var i = 0,
++        coords = len ? new Array(len) : [],
++        p = 0;
++
++    while (len ? i < len : pbf.pos < end) {
++        p += pbf.readSVarint();
++        coords[i] = p;
++        i++;
++    }
++
++    return coords;
++}
++
++function readMultiPoint(pbf) {
++    return readMultiPointPart(pbf, pbf.readVarint() + pbf.pos);
++}
++
++function readLine(pbf) {
++    return readLinePart(pbf, pbf.readVarint() + pbf.pos);
+ }
+ 
+ function readMultiLine(pbf) {
+
+					```
+				</section>
+				<section data-markdown>
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  123.03|  119.80|  105.11|  178.09|    9.83|
+|         topobuf&nbsp;nj|  899.68|  813.92|  781.53| 1123.77|   14.61|
+|         topobuf&nbsp;pa| 2433.58| 2373.39| 2214.06| 3810.96|   11.25|
+				</section>
+				<section data-markdown>
+					# Lesson #6
+					How did we do?
+
+Original:
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  203.09|  180.04|  159.75|  629.76|   30.85|
+|         topobuf&nbsp;nj| 1308.09| 1255.69| 1129.22| 1579.52|   11.37|
+|         topobuf&nbsp;pa| 6366.98| 6353.54| 5780.21| 7254.15|    2.35|
+
+Improved:
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  123.03|  119.80|  105.11|  178.09|    9.83|
+|         topobuf&nbsp;nj|  899.68|  813.92|  781.53| 1123.77|   14.61|
+|         topobuf&nbsp;pa| 2433.58| 2373.39| 2214.06| 3810.96|   11.25|
+
+				</section>
+				<section data-markdown>
+
+Improved:
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|         topobuf&nbsp;de|  123.03|  119.80|  105.11|  178.09|    9.83|
+|         topobuf&nbsp;nj|  899.68|  813.92|  781.53| 1123.77|   14.61|
+|         topobuf&nbsp;pa| 2433.58| 2373.39| 2214.06| 3810.96|   11.25|
+
+Comparison:
+|                   Title|    Mean|  Median|     Min|     Max|     SD%|
+|------------------------|-------:|-------:|-------:|-------:|-------:|
+|      JSON.parse&nbsp;de|  118.57|  108.00|  100.35|  397.44|   32.53|
+|      JSON.parse&nbsp;nj|  899.58|  752.35|  719.19| 1242.87|   22.23|
+|      JSON.parse&nbsp;pa| 2778.16| 2802.84| 2595.76| 2919.13|    3.55|
+
+				</section>
+				<section data-markdown>
+				</section>
 			</div>
 		</div>
 
@@ -30,6 +490,8 @@
 			// - https://revealjs.com/initialization/
 			// - https://revealjs.com/config/
 			Reveal.initialize({
+				height: "100%",
+				width: "90%",
 				hash: true,
 
 				// Learn about plugins: https://revealjs.com/plugins/
